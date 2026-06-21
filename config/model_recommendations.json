@@ -1,0 +1,22 @@
+{
+  "recommended_google_models": {
+    "stable": [
+      "gemini-2.0-flash",
+      "gemini-1.5-pro",
+      "gemini-1.5-flash"
+    ],
+    "problematic": [
+      "gemini-2.5-pro",
+      "gemini-2.5-flash",
+      "gemini-2.5-flash-lite",
+      "gemini-2.5-pro-002",
+      "gemini-2.5-flash-002"
+    ],
+    "default_config": {
+      "deep_think_llm": "gemini-1.5-pro",
+      "quick_think_llm": "gemini-2.0-flash"
+    },
+    "last_updated": "2025-08-01",
+    "note": "Gemini 2.5系列模型当前返回空内容，建议使用稳定版本"
+  }
+}

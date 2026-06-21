@@ -1,0 +1,591 @@
+"""
+提示词模板客户端 - 用于Agent从模板系统获取提示词
+
+使用 PostgreSQL (quantDB) 获取模板，与 app.core.database 的 PostgresDBCompat 兼容
+数据库无模板时，从 install/database_export_config_*.json 兜底加载
+"""
+
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from tradingagents.utils.logging_init import get_logger
+
+logger = get_logger("template_client")
+
+# 文件兜底缓存：避免重复读取大 JSON
+_file_templates_cache: Optional[List[Dict[str, Any]]] = None
+
+
+def _to_str_id(val: Any) -> Optional[str]:
+    """将 ObjectId 或任意 id 转为字符串，用于 PostgreSQL JSONB 查询"""
+    if val is None:
+        return None
+    s = str(val).strip()
+    return s if s else None
+
+
+class TemplateClient:
+    """提示词模板客户端 - 使用 PostgreSQL (quantDB)"""
+
+    def __init__(self, db=None):
+        """
+        初始化模板客户端
+
+        Args:
+            db: 数据库实例（PostgresDBCompat），默认从 app.core.database 获取
+        """
+        if db is None:
+            try:
+                from app.core.database import get_mongo_db_sync
+                db = get_mongo_db_sync()
+            except ImportError as e:
+                logger.error(f"❌ 无法导入 app.core.database: {e}，请确保 PostgreSQL 已配置")
+                raise RuntimeError("模板客户端需要 app.core.database (PostgreSQL)，请检查环境") from e
+
+        self.db = db
+        self.templates_collection = self.db.prompt_templates
+        self.configs_collection = self.db.user_template_configs
+
+        logger.info("✅ 模板客户端初始化成功 (PostgreSQL)")
+
+    def get_effective_template(
+        self,
+        agent_type: str,
+        agent_name: str,
+        user_id: Optional[str] = None,
+        preference_id: Optional[str] = None,
+        context: Optional[Any] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        获取有效模板（调试模板优先，用户模板次之，系统模板兜底）
+
+        Args:
+            agent_type: Agent类型（analysts, researchers, debators, managers, trader）
+            agent_name: Agent名称
+            user_id: 用户ID（可选）
+            preference_id: 偏好ID（可选，默认为neutral）
+            context: AgentContext对象，包含调试模式信息
+
+        Returns:
+            模板内容字典，包含system_prompt、tool_guidance、analysis_requirements等字段
+            如果获取失败返回None
+        """
+        try:
+            # 兼容 context 为 dict 或 AgentContext 对象
+            ctx_user = None
+            ctx_pref = None
+            is_debug_mode = False
+            debug_template_id = None
+
+            if context:
+                if isinstance(context, dict):
+                    ctx_user = context.get('user_id')
+                    ctx_pref = context.get('preference_id')
+                    is_debug_mode = context.get('is_debug_mode', False)
+                    debug_template_id = context.get('debug_template_id') if is_debug_mode else None
+                else:
+                    ctx_user = getattr(context, 'user_id', None)
+                    ctx_pref = getattr(context, 'preference_id', None)
+                    is_debug_mode = getattr(context, 'is_debug_mode', False)
+                    # 🔥 修复：无论 is_debug_mode 是否为 True，都应该提取 debug_template_id
+                    debug_template_id = getattr(context, 'debug_template_id', None)
+            
+            # 调试信息仅 DEBUG 级别输出，避免分析过程刷屏
+            logger.debug(
+                f"[get_effective_template] context={type(context).__name__} "
+                f"user_id={ctx_user} pref={ctx_pref} debug={is_debug_mode}"
+            )
+
+            # 🔥 调试模板优先级最高：如果提供了 debug_template_id，直接使用调试模板（最高优先级）
+            # 注意：调试模式下不检查 agent_type 和 agent_name 是否匹配，允许跨类型调试
+            # 🔥 修复：即使 is_debug_mode 为 False，只要提供了 debug_template_id，也应该使用调试模板
+            if debug_template_id:
+                logger.info(f"🔍 [调试模式] 使用调试模板ID: {debug_template_id} (最高优先级)")
+                try:
+                    template_id_str = _to_str_id(debug_template_id)
+                    debug_template = self.templates_collection.find_one({"_id": template_id_str}) if template_id_str else None
+
+                    if debug_template:
+                        # 🔥 验证模板的 agent_type 和 agent_name（仅用于日志，不阻止使用）
+                        template_agent_type = debug_template.get("agent_type")
+                        template_agent_name = debug_template.get("agent_name")
+                        
+                        if template_agent_type != agent_type or template_agent_name != agent_name:
+                            logger.warning(
+                                f"⚠️ [调试模式] 调试模板的 agent_type/agent_name 不匹配: "
+                                f"模板({template_agent_type}/{template_agent_name}) vs "
+                                f"请求({agent_type}/{agent_name})，但仍使用调试模板（调试模式允许跨类型）"
+                            )
+                        
+                        logger.info(
+                            f"✅ [调试模式] 成功获取调试模板: {agent_type}/{agent_name} "
+                            f"(template_id={template_id_str}, 模板类型={template_agent_type}/{template_agent_name})"
+                        )
+                        content = debug_template.get("content") or {}
+                        
+                        # 🔥 调试：打印模板内容的详细信息
+                        logger.info(f"🔍 [调试模式] 模板内容字段: {list(content.keys())}")
+                        if "user_prompt" in content:
+                            user_prompt_preview = str(content["user_prompt"])[:200] if content["user_prompt"] else ""
+                            logger.info(f"🔍 [调试模式] user_prompt 长度: {len(str(content.get('user_prompt', '')))}, 前200字符: {user_prompt_preview}")
+                        if "system_prompt" in content:
+                            system_prompt_preview = str(content["system_prompt"])[:200] if content["system_prompt"] else ""
+                            logger.info(f"🔍 [调试模式] system_prompt 长度: {len(str(content.get('system_prompt', '')))}, 前200字符: {system_prompt_preview}")
+                        
+                        content["source"] = "debug"
+                        content["template_id"] = str(debug_template.get("_id"))
+                        content["version"] = debug_template.get("version", 1)
+                        content["is_debug"] = True
+                        logger.info(f"🔍 [调试模式] 调试模板优先级最高，直接返回，跳过后续 agent 配置检查")
+                        return content
+                    else:
+                        logger.warning(f"⚠️ [调试模式] 调试模板不存在: {debug_template_id}，降级到正常流程")
+                except Exception as e:
+                    logger.error(f"❌ [调试模式] 获取调试模板失败: {e}，降级到正常流程")
+            
+            # 🔥 如果启用了调试模式但没有调试模板ID，记录警告但不阻止继续
+            if is_debug_mode and not debug_template_id:
+                logger.warning(f"⚠️ [调试模式] 启用了调试模式但未提供 debug_template_id，将使用正常流程")
+
+            # 默认偏好为neutral
+            # 兼容 context 为 dict 或 AgentContext 对象
+            if context:
+                if isinstance(context, dict):
+                    # context 是字典
+                    preference_id = context.get("preference_id") or preference_id
+                    user_id = context.get("user_id") or user_id
+                else:
+                    # context 是 AgentContext 对象
+                    preference_id = context.preference_id if context.preference_id else preference_id
+                    user_id = context.user_id if context.user_id else user_id
+            preference_id = preference_id or "neutral"
+
+            # 1. 优先级1：如果指定了user_id，先检查用户在agent配置中是否设置了模板
+            user_config_template = None
+            if user_id:
+                user_id_str = _to_str_id(user_id)
+
+                if user_id_str:
+                    config_query = {
+                        "user_id": user_id_str,
+                        "agent_type": agent_type,
+                        "agent_name": agent_name,
+                        "is_active": True
+                    }
+                    config = self.configs_collection.find_one(config_query)
+
+                    if config and config.get("template_id"):
+                        template_id_str = _to_str_id(config["template_id"])
+                        if not template_id_str:
+                            logger.debug(f"[get_effective_template] template_id 转换失败")
+
+                        # 🔥 只使用已发布状态的模板
+                        template = self.templates_collection.find_one({
+                            "_id": template_id_str,
+                            "status": "active"
+                        }) if template_id_str else None
+
+                        if template:
+                            logger.debug(
+                                f"[get_effective_template] 用户配置模板: {agent_type}/{agent_name}"
+                            )
+                            content = template.get("content") or {}
+                            content["source"] = "user_config"
+                            content["template_id"] = str(template.get("_id"))
+                            content["version"] = template.get("version", 1)
+                            content["selected_preference"] = config.get("preference_id") or preference_id
+                            return content
+                        else:
+                            # 如果用户配置的模板是草稿状态，记录警告并跳过
+                            logger.warning(
+                                f"⚠️ 用户配置的模板 {template_id_str} 不是已发布状态或不存在，降级到用户偏好模板"
+                            )
+                            logger.debug("[get_effective_template] 用户配置模板不可用，降级")
+
+            # 2. 优先级2：查找用户偏好对应的系统模板
+            system_query = {
+                "agent_type": agent_type,
+                "agent_name": agent_name,
+                "preference_type": preference_id,
+                "is_system": True,
+                "status": "active"
+            }
+
+            system_template = self.templates_collection.find_one(system_query)
+
+            if system_template:
+                logger.debug(
+                    f"[get_effective_template] 系统模板: {agent_type}/{agent_name} pref={preference_id}"
+                )
+                content = system_template.get("content") or {}
+                content["source"] = "system"
+                content["template_id"] = str(system_template.get("_id"))
+                content["version"] = system_template.get("version", 1)
+                content["selected_preference"] = preference_id
+                return content
+
+            # 3. 优先级3：如果没有找到用户偏好对应的模板，降级到默认neutral模板
+            if preference_id != "neutral":
+                logger.debug(
+                    f"[get_effective_template] 降级到neutral: {agent_type}/{agent_name}"
+                )
+                neutral_query = {
+                    "agent_type": agent_type,
+                    "agent_name": agent_name,
+                    "preference_type": "neutral",
+                    "is_system": True,
+                    "status": "active"
+                }
+                neutral_template = self.templates_collection.find_one(neutral_query)
+                if neutral_template:
+                    logger.debug(f"[get_effective_template] neutral模板: {agent_type}/{agent_name}")
+                    content = neutral_template.get("content") or {}
+                    content["source"] = "system"
+                    content["template_id"] = str(neutral_template.get("_id"))
+                    content["version"] = neutral_template.get("version", 1)
+                    content["selected_preference"] = "neutral"
+                    return content
+
+            # 4. 优先级4：从 install/database_export_config_*.json 兜底加载
+            content = self._load_template_from_file(agent_type, agent_name, preference_id)
+            if content:
+                return content
+
+            logger.debug(
+                f"[get_effective_template] 未找到模板: {agent_type}/{agent_name} (preference={preference_id})"
+            )
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ 获取模板异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _load_template_from_file(
+        self,
+        agent_type: str,
+        agent_name: str,
+        preference_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        从 install/database_export_config_*.json 兜底加载模板。
+        当数据库无模板或连接失败时使用，避免分析过程报错。
+        """
+        global _file_templates_cache
+        try:
+            if _file_templates_cache is None:
+                install_dir = Path(__file__).resolve().parent.parent.parent / "install"
+                config_files = sorted(install_dir.glob("database_export_config_*.json"))
+                if not config_files:
+                    return None
+                with open(config_files[-1], "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                _file_templates_cache = data.get("data", {}).get("prompt_templates", [])
+            for t in _file_templates_cache:
+                if (
+                    t.get("agent_type") == agent_type
+                    and t.get("agent_name") == agent_name
+                    and t.get("preference_type") == preference_id
+                    and t.get("is_system") in (True, "true")
+                    and t.get("status") == "active"
+                ):
+                    content = t.get("content") or {}
+                    content = dict(content)
+                    content["source"] = "file"
+                    content["template_id"] = str(t.get("_id", ""))
+                    content["version"] = t.get("version", 1)
+                    content["selected_preference"] = preference_id
+                    logger.debug(
+                        f"[get_effective_template] 从文件兜底加载: {agent_type}/{agent_name}"
+                    )
+                    return content
+            if preference_id != "neutral":
+                for t in _file_templates_cache:
+                    if (
+                        t.get("agent_type") == agent_type
+                        and t.get("agent_name") == agent_name
+                        and t.get("preference_type") == "neutral"
+                        and t.get("is_system") in (True, "true")
+                        and t.get("status") == "active"
+                    ):
+                        content = t.get("content") or {}
+                        content = dict(content)
+                        content["source"] = "file"
+                        content["template_id"] = str(t.get("_id", ""))
+                        content["version"] = t.get("version", 1)
+                        content["selected_preference"] = "neutral"
+                        logger.debug(
+                            f"[get_effective_template] 从文件兜底加载(neutral): {agent_type}/{agent_name}"
+                        )
+                        return content
+        except Exception as e:
+            logger.debug(f"[get_effective_template] 文件兜底加载失败: {e}")
+        return None
+
+    def format_template(
+        self,
+        template_content: Dict[str, Any],
+        variables: Dict[str, Any]
+    ) -> Dict[str, str]:
+        """
+        格式化模板，替换变量
+
+        支持两种语法：
+        1. 单层花括号：{variable_name}
+        2. 双层花括号（Jinja2风格）：{{variable.nested_key}}
+
+        Args:
+            template_content: 模板内容字典（从get_effective_template返回）
+            variables: 变量字典，支持嵌套，如 {"trade": {"code": "300274"}}
+
+        Returns:
+            格式化后的模板内容字典
+        """
+        try:
+            if not variables:
+                logger.debug("[format_template] 变量字典为空")
+
+            def get_nested_value(data: Dict[str, Any], path: str) -> Any:
+                """获取嵌套字典的值，支持点号路径如 'trade.code'"""
+                keys = path.split('.')
+                value = data
+                for key in keys:
+                    if isinstance(value, dict):
+                        value = value.get(key, '')
+                    else:
+                        return ''
+                return value
+
+            def replace_variable(match):
+                """替换变量占位符"""
+                var_path = match.group(1).strip()
+                value = get_nested_value(variables, var_path)
+                # logger.info(f"  替换 {{{{{var_path}}}}} -> {value}")  # 太多了，注释掉
+                return str(value) if value is not None else ''
+
+            formatted = {}
+
+            # 🔧 支持两种语法：
+            # 1. 双层花括号 {{variable.path}}（Jinja2风格，优先级高）
+            # 2. 单层花括号 {variable}（简单变量，避免与内容冲突）
+            # 先处理双层花括号，再处理单层花括号（避免冲突）
+            double_brace_pattern = re.compile(r'\{\{([^}]+)\}\}')
+            # 单层花括号：只匹配 {变量名}，变量名只能是字母、数字、下划线的组合
+            single_brace_pattern = re.compile(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}')
+
+            for key, value in template_content.items():
+                if isinstance(value, str):
+                    formatted_value = value
+                    
+                    # 第一步：替换双层花括号变量 {{variable.path}}
+                    def replacer_double(match):
+                        var_path = match.group(1).strip()
+                        val = get_nested_value(variables, var_path)
+                        return str(val) if val is not None else ''
+                    
+                    formatted_value = double_brace_pattern.sub(replacer_double, formatted_value)
+                    
+                    # 第二步：替换单层花括号变量 {variable}（仅匹配简单变量名）
+                    def replacer_single(match):
+                        var_name = match.group(1).strip()
+                        # 直接从variables字典中获取（不支持嵌套路径）
+                        val = variables.get(var_name)
+                        return str(val) if val is not None else ''
+                    
+                    formatted_value = single_brace_pattern.sub(replacer_single, formatted_value)
+                    formatted[key] = formatted_value
+
+                    # 检查是否还有未替换的变量（只针对system_prompt和user_prompt）
+                    if key in ['system_prompt', 'user_prompt']:
+                        # 检查双层花括号
+                        unmatched_double = re.findall(r'\{\{([^}]+)\}\}', formatted_value)
+                        # 检查单层花括号（简单变量名）
+                        unmatched_single = re.findall(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}', formatted_value)
+                        if unmatched_double or unmatched_single:
+                            total_unmatched = len(unmatched_double) + len(unmatched_single)
+                            logger.warning(f"⚠️ [模板渲染] {key} 中可能有 {total_unmatched} 个未渲染的变量")
+                            # 显示前200字符
+                            logger.warning(f"⚠️ [模板渲染] {key} 前200字符: {formatted_value[:200]}")
+                            if unmatched_double:
+                                for var_name in unmatched_double:
+                                    logger.warning(f"  - 未替换(双层): {var_name}")
+                            if unmatched_single:
+                                for var_name in unmatched_single:
+                                    logger.warning(f"  - 未替换(单层): {var_name}")
+                else:
+                    formatted[key] = value
+
+            return formatted
+
+        except Exception as e:
+            logger.error(f"[TemplateClient] 格式化模板异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+
+
+# 全局单例
+_template_client = None
+
+
+def get_template_client() -> TemplateClient:
+    """获取全局模板客户端单例"""
+    global _template_client
+    if _template_client is None:
+        _template_client = TemplateClient()
+    return _template_client
+
+
+def get_agent_prompt(
+    agent_type: str,
+    agent_name: str,
+    variables: Dict[str, str],
+    user_id: Optional[str] = None,
+    preference_id: Optional[str] = None,
+    fallback_prompt: Optional[str] = None,
+        context: Optional[Any] = None
+) -> str:
+    """
+    获取Agent提示词（便捷函数）
+
+    Args:
+        agent_type: Agent类型
+        agent_name: Agent名称
+        variables: 模板变量字典（如ticker、company_name、current_date等）
+        user_id: 用户ID（可选）
+        preference_id: 偏好ID（可选）
+        fallback_prompt: 降级提示词（当API不可用时使用）
+        
+    Returns:
+        完整的提示词字符串
+    """
+    try:
+        client = get_template_client()
+
+        # 从 PostgreSQL 获取模板
+        template_content = client.get_effective_template(agent_type, agent_name, user_id, preference_id, context)
+
+        if template_content:
+            logger.debug(f"[模板渲染] 变量数量: {len(variables)}")
+
+            # 格式化模板
+            formatted = client.format_template(template_content, variables)
+            # 检查是否还有未渲染的变量
+            for key, value in formatted.items():
+                if isinstance(value, str) and ('{{' in value or '{' in value):
+                    # 检查双层花括号
+                    unmatched_double = re.findall(r'\{\{([^}]+)\}\}', value)
+                    # 检查单层花括号（简单变量名）
+                    unmatched_single = re.findall(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}', value)
+
+                    if unmatched_double or unmatched_single:
+                        total_unmatched = len(unmatched_double) + len(unmatched_single)
+                        logger.warning(f"⚠️ [模板渲染] {key} 中可能有 {total_unmatched} 个未渲染的变量")
+                        # 显示前200字符
+                        logger.warning(f"⚠️ [模板渲染] {key} 前200字符: {value[:200]}")
+                        # 打印具体的未渲染变量名
+                        if unmatched_double:
+                            logger.warning(f"  📌 未渲染变量(双层花括号): {', '.join(unmatched_double)}")
+                        if unmatched_single:
+                            logger.warning(f"  📌 未渲染变量(单层花括号): {', '.join(unmatched_single)}")
+
+            # 组合完整提示词
+            parts = []
+            if formatted.get("system_prompt"):
+                parts.append(formatted["system_prompt"])
+            if formatted.get("tool_guidance"):
+                parts.append("\n\n" + formatted["tool_guidance"])
+            if formatted.get("analysis_requirements"):
+                parts.append("\n\n" + formatted["analysis_requirements"])
+            if formatted.get("output_format"):
+                parts.append("\n\n" + formatted["output_format"])
+            if formatted.get("constraints"):
+                parts.append("\n\n" + formatted["constraints"])
+
+            prompt = "\n".join(parts)
+            logger.debug(f"[模板渲染] 成功: {agent_type}/{agent_name} 长度={len(prompt)}")
+            return prompt
+        else:
+            logger.debug(
+                f"[get_agent_prompt] 使用降级提示词: {agent_type}/{agent_name}"
+            )
+            return fallback_prompt or "请进行分析。"
+
+    except Exception as e:
+        logger.debug(f"[get_agent_prompt] 异常: {e}")
+        return fallback_prompt or "请进行分析。"
+
+
+def get_user_prompt(
+    agent_type: str,
+    agent_name: str,
+    variables: Dict[str, Any],
+    user_id: Optional[str] = None,
+    preference_id: Optional[str] = None,
+    fallback_prompt: Optional[str] = None,
+        context: Optional[Any] = None
+) -> str:
+    """
+    获取Agent用户提示词（便捷函数）
+
+    Args:
+        agent_type: Agent类型
+        agent_name: Agent名称
+        variables: 模板变量字典（包含所有需要替换的数据）
+        user_id: 用户ID（可选）
+        preference_id: 偏好ID（可选）
+        fallback_prompt: 降级提示词（当API不可用时使用）
+
+    Returns:
+        渲染后的用户提示词字符串
+    """
+    try:
+        client = get_template_client()
+
+        # 从 PostgreSQL 获取模板
+        template_content = client.get_effective_template(agent_type, agent_name, user_id, preference_id, context)
+
+        if template_content:
+            # 格式化模板
+            formatted = client.format_template(template_content, variables)
+
+            # 返回用户提示词
+            user_prompt = formatted.get("user_prompt", "")
+            if user_prompt:
+                # 检查是否还有未渲染的变量
+                unmatched_double = re.findall(r'\{\{([^}]+)\}\}', user_prompt)
+                unmatched_single = re.findall(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}', user_prompt)
+
+                if unmatched_double or unmatched_single:
+                    total_unmatched = len(unmatched_double) + len(unmatched_single)
+                    logger.warning(f"⚠️ [get_user_prompt] user_prompt 中可能有 {total_unmatched} 个未渲染的变量")
+                    logger.warning(f"⚠️ [get_user_prompt] user_prompt 前200字符: {user_prompt[:200]}")
+                    if unmatched_double:
+                        logger.warning(f"  📌 未渲染变量(双层花括号): {', '.join(unmatched_double)}")
+                    if unmatched_single:
+                        logger.warning(f"  📌 未渲染变量(单层花括号): {', '.join(unmatched_single)}")
+
+                logger.debug(f"[get_user_prompt] 成功: {agent_type}/{agent_name}")
+                return user_prompt
+            else:
+                logger.debug(f"[get_user_prompt] 无 user_prompt 字段: {agent_type}/{agent_name}")
+                return fallback_prompt or "请进行分析。"
+        else:
+            logger.debug(f"[get_user_prompt] 使用降级: {agent_type}/{agent_name}")
+            return fallback_prompt or "请进行分析。"
+
+    except Exception as e:
+        logger.debug(f"[get_user_prompt] 异常: {e}")
+        return fallback_prompt or "请进行分析。"
+
+
+def close_template_client():
+    """关闭全局模板客户端连接（PostgreSQL 使用连接池，仅重置单例）"""
+    global _template_client
+    if _template_client is not None:
+        _template_client = None
+        logger.info("✅ 模板客户端已重置")
+

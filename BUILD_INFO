@@ -1,0 +1,9 @@
+﻿{
+    "build_type":  "portable",
+    "version":  "2.0.0",
+    "build_date":  "2026-02-08T11:36:05Z",
+    "git_commit":  "9717a58",
+    "full_version":  "2.0.0-build20260208-113605",
+    "build_unix":  1770550566,
+    "build_timestamp":  "20260208-113605"
+}

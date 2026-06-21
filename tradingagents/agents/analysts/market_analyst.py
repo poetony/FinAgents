@@ -1,0 +1,568 @@
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+import time
+import json
+import traceback
+
+# 导入分析模块日志装饰器
+from tradingagents.utils.tool_logging import log_analyst_module
+
+# 导入统一日志系统
+from tradingagents.utils.logging_init import get_logger
+logger = get_logger("default")
+
+# 导入Google工具调用处理器
+from tradingagents.agents.utils.google_tool_handler import GoogleToolCallHandler
+
+# 导入模板客户端
+from tradingagents.utils.template_client import get_agent_prompt
+
+
+def _get_company_name(ticker: str, market_info: dict) -> str:
+    """
+    根据股票代码获取公司名称
+
+    Args:
+        ticker: 股票代码
+        market_info: 市场信息字典
+
+    Returns:
+        str: 公司名称
+    """
+    try:
+        if market_info['is_china']:
+            # 中国A股：使用统一接口获取股票信息
+            from tradingagents.dataflows.interface import get_china_stock_info_unified
+            stock_info = get_china_stock_info_unified(ticker)
+
+            logger.debug(f"📊 [市场分析师] 获取股票信息返回: {stock_info[:200] if stock_info else 'None'}...")
+
+            # 解析股票名称
+            if stock_info and "股票名称:" in stock_info:
+                company_name = stock_info.split("股票名称:")[1].split("\n")[0].strip()
+                logger.info(f"✅ [市场分析师] 成功获取中国股票名称: {ticker} -> {company_name}")
+                return company_name
+            else:
+                # 降级方案：尝试直接从数据源管理器获取
+                logger.warning(f"⚠️ [市场分析师] 无法从统一接口解析股票名称: {ticker}，尝试降级方案")
+                try:
+                    from tradingagents.dataflows.data_source_manager import get_china_stock_info_unified as get_info_dict
+                    info_dict = get_info_dict(ticker)
+                    if info_dict and info_dict.get('name'):
+                        company_name = info_dict['name']
+                        logger.info(f"✅ [市场分析师] 降级方案成功获取股票名称: {ticker} -> {company_name}")
+                        return company_name
+                except Exception as e:
+                    logger.error(f"❌ [市场分析师] 降级方案也失败: {e}")
+
+                logger.error(f"❌ [市场分析师] 所有方案都无法获取股票名称: {ticker}")
+                return f"股票代码{ticker}"
+
+        elif market_info['is_hk']:
+            # 港股：使用改进的港股工具
+            try:
+                from tradingagents.dataflows.providers.hk.improved_hk import get_hk_company_name_improved
+                company_name = get_hk_company_name_improved(ticker)
+                logger.debug(f"📊 [DEBUG] 使用改进港股工具获取名称: {ticker} -> {company_name}")
+                return company_name
+            except Exception as e:
+                logger.debug(f"📊 [DEBUG] 改进港股工具获取名称失败: {e}")
+                # 降级方案：生成友好的默认名称
+                clean_ticker = ticker.replace('.HK', '').replace('.hk', '')
+                return f"港股{clean_ticker}"
+
+        elif market_info['is_us']:
+            # 美股：使用简单映射或返回代码
+            us_stock_names = {
+                'AAPL': '苹果公司',
+                'TSLA': '特斯拉',
+                'NVDA': '英伟达',
+                'MSFT': '微软',
+                'GOOGL': '谷歌',
+                'AMZN': '亚马逊',
+                'META': 'Meta',
+                'NFLX': '奈飞'
+            }
+
+            company_name = us_stock_names.get(ticker.upper(), f"美股{ticker}")
+            logger.debug(f"📊 [DEBUG] 美股名称映射: {ticker} -> {company_name}")
+            return company_name
+
+        else:
+            return f"股票{ticker}"
+
+    except Exception as e:
+        logger.error(f"❌ [DEBUG] 获取公司名称失败: {e}")
+        return f"股票{ticker}"
+
+
+def create_market_analyst(llm, toolkit):
+
+    def market_analyst_node(state):
+        logger.debug(f"📈 [DEBUG] ===== 市场分析师节点开始 =====")
+
+        # 🔧 工具调用计数器 - 防止无限循环
+        tool_call_count = state.get("market_tool_call_count", 0)
+        max_tool_calls = 3  # 最大工具调用次数
+        logger.info(f"🔧 [死循环修复] 当前工具调用次数: {tool_call_count}/{max_tool_calls}")
+
+        current_date = state["trade_date"]
+        ticker = state["company_of_interest"]
+
+        logger.debug(f"📈 [DEBUG] 输入参数: ticker={ticker}, date={current_date}")
+        logger.debug(f"📈 [DEBUG] 当前状态中的消息数量: {len(state.get('messages', []))}")
+        logger.debug(f"📈 [DEBUG] 现有市场报告: {state.get('market_report', 'None')}")
+
+        # 根据股票代码格式选择数据源
+        from tradingagents.utils.stock_utils import StockUtils
+
+        market_info = StockUtils.get_market_info(ticker)
+
+        logger.debug(f"📈 [DEBUG] 股票类型检查: {ticker} -> {market_info['market_name']} ({market_info['currency_name']})")
+
+        # 获取公司名称
+        company_name = _get_company_name(ticker, market_info)
+        logger.debug(f"📈 [DEBUG] 公司名称: {ticker} -> {company_name}")
+
+        # 统一使用 get_stock_market_data_unified 工具
+        # 该工具内部会自动识别股票类型（A股/港股/美股）并调用相应的数据源
+        logger.info(f"📊 [市场分析师] 使用统一市场数据工具，自动识别股票类型")
+        tools = [toolkit.get_stock_market_data_unified]
+
+        # 安全地获取工具名称用于调试
+        tool_names_debug = []
+        for tool in tools:
+            if hasattr(tool, 'name'):
+                tool_names_debug.append(tool.name)
+            elif hasattr(tool, '__name__'):
+                tool_names_debug.append(tool.__name__)
+            else:
+                tool_names_debug.append(str(tool))
+        logger.info(f"📊 [市场分析师] 绑定的工具: {tool_names_debug}")
+        logger.info(f"📊 [市场分析师] 目标市场: {market_info['market_name']}")
+
+        # 🆕 使用模板系统获取提示词
+        try:
+            # 准备模板变量
+            template_variables = {
+                "ticker": ticker,
+                "company_name": company_name,
+                "market_name": market_info['market_name'],
+                "current_date": current_date,
+                "start_date": current_date,
+                "currency_name": market_info['currency_name'],
+                "currency_symbol": market_info['currency_symbol'],
+                "tool_names": ", ".join(tool_names_debug)
+            }
+
+            from tradingagents.utils.template_client import get_template_client
+            ctx = state.get("agent_context") or {}
+            tpl_info = get_template_client().get_effective_template(
+                agent_type="analysts",
+                agent_name="market_analyst",
+                user_id=ctx.get("user_id"),
+                preference_id=ctx.get("preference_id") or "neutral",
+                context=None
+            )
+            if tpl_info:
+                logger.debug(f"[市场分析师] 模板 source={tpl_info.get('source')}")
+
+            # 从模板系统获取提示词
+            system_prompt = get_agent_prompt(
+                agent_type="analysts",
+                agent_name="market_analyst",
+                variables=template_variables,
+                user_id=ctx.get("user_id"),
+                preference_id=ctx.get("preference_id") or "neutral",
+                fallback_prompt=None,
+                context=None
+            )
+
+            # 检查模板内容是否有效（防止模板系统返回默认6字占位符）
+            if not system_prompt or len(system_prompt.strip()) < 100:
+                raise ValueError(f"模板内容不足({len(system_prompt or '')}字符)，使用硬编码提示词")
+            logger.debug(f"[市场分析师] 模板获取成功 长度={len(system_prompt)}")
+
+        except Exception as e:
+            logger.debug(f"[市场分析师] 模板获取失败，使用硬编码: {e}")
+            # 降级：使用硬编码提示词（含技术指标使用说明）
+            system_prompt = (
+                f"你是一位专业的股票市场分析师，与其他分析师协作。\n\n"
+                f"📋 **分析对象：**\n"
+                f"- 公司名称：{company_name}\n"
+                f"- 股票代码：{ticker}\n"
+                f"- 所属市场：{market_info['market_name']}\n"
+                f"- 计价货币：{market_info['currency_name']}（{market_info['currency_symbol']}）\n"
+                f"- 分析日期：{current_date}\n\n"
+                f"🔧 **工具使用：**\n"
+                f"你可以使用以下工具：{', '.join(tool_names_debug)}\n"
+                f"⚠️ 重要工作流程：\n"
+                f"1. 如果消息历史中没有工具结果，立即调用 get_stock_market_data_unified 工具\n"
+                f"2. 如果消息历史中已经有工具结果（ToolMessage），立即基于工具数据生成最终分析报告\n"
+                f"3. 不要重复调用工具！一次工具调用就足够了！\n\n"
+                f"📊 **技术指标使用要求：**\n"
+                f"工具返回的数据包含「移动平均线(MA5/MA10/MA20/MA60)」「MACD」「RSI」「布林带」等技术指标。"
+                f"请务必使用这些数值进行分析，不得声称「数据源未提供」或「无法进行MA分析」。\n\n"
+                f"请使用中文，基于真实数据进行分析。"
+            )
+            logger.warning(f"⚠️ [市场分析师] 使用降级提示词 (长度: {len(system_prompt)})")
+
+        # 创建提示模板
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", system_prompt),
+                MessagesPlaceholder(variable_name="messages"),
+            ]
+        )
+
+        # 添加详细日志
+        logger.info(f"📊 [市场分析师] LLM类型: {llm.__class__.__name__}")
+        logger.info(f"📊 [市场分析师] LLM模型: {getattr(llm, 'model_name', 'unknown')}")
+        logger.info(f"📊 [市场分析师] 消息历史数量: {len(state['messages'])}")
+        logger.info(f"📊 [市场分析师] 公司名称: {company_name}")
+        logger.info(f"📊 [市场分析师] 股票代码: {ticker}")
+
+        # 打印提示词模板信息
+        logger.info("📊 [市场分析师] ========== 提示词模板信息 ==========")
+        logger.info(f"📊 [市场分析师] 模板变量已设置: company_name={company_name}, ticker={ticker}, market={market_info['market_name']}")
+        logger.info("📊 [市场分析师] ==========================================")
+
+        # 打印实际传递给LLM的消息
+        logger.info(f"📊 [市场分析师] ========== 传递给LLM的消息 ==========")
+        for i, msg in enumerate(state["messages"]):
+            msg_type = type(msg).__name__
+            # 🔥 修复：更安全地提取消息内容
+            if hasattr(msg, 'content'):
+                msg_content = str(msg.content)[:500]  # 增加到500字符以便查看完整内容
+            elif isinstance(msg, tuple) and len(msg) >= 2:
+                # 处理旧格式的元组消息 ("human", "content")
+                msg_content = f"[元组消息] 类型={msg[0]}, 内容={str(msg[1])[:500]}"
+            else:
+                msg_content = str(msg)[:500]
+            logger.info(f"📊 [市场分析师] 消息[{i}] 类型={msg_type}, 内容={msg_content}")
+        logger.info(f"📊 [市场分析师] ========== 消息列表结束 ==========")
+
+        chain = prompt | llm.bind_tools(tools)
+
+        logger.info(f"📊 [市场分析师] 开始调用LLM...")
+        # 🔧 修复占位符：create_msg_delete 注入的 "Continue" 会导致 LLM 误判，替换为明确任务
+        messages_for_invoke = state["messages"]
+        if messages_for_invoke and len(messages_for_invoke) == 1:
+            single = messages_for_invoke[0]
+            if hasattr(single, "content") and str(single.content).strip().lower() == "continue":
+                messages_for_invoke = [
+                    HumanMessage(content=f"请分析股票 {ticker}（{company_name}）的市场数据，调用 get_stock_market_data_unified 获取数据后撰写技术分析报告。")
+                ]
+                logger.info(f"📊 [市场分析师] 已替换占位符为任务提示")
+        # 🔑 修复：传递所有模板变量，而不仅仅是 messages
+        invoke_params = {
+            "messages": messages_for_invoke,
+            **template_variables  # 包含 ticker, company_name, market_name, current_date, currency_symbol, currency_name, tool_names
+        }
+        logger.debug(f"📊 [市场分析师] 调用参数: {list(invoke_params.keys())}")
+        result = chain.invoke(invoke_params)
+        logger.info(f"📊 [市场分析师] LLM调用完成")
+
+        # 打印LLM响应
+        logger.info(f"📊 [市场分析师] ========== LLM响应开始 ==========")
+        logger.info(f"📊 [市场分析师] 响应类型: {type(result).__name__}")
+        logger.info(f"📊 [市场分析师] 响应内容: {str(result.content)[:1000]}...")
+        if hasattr(result, 'tool_calls') and result.tool_calls:
+            logger.info(f"📊 [市场分析师] 工具调用: {result.tool_calls}")
+        logger.info(f"📊 [市场分析师] ========== LLM响应结束 ==========")
+
+        # 使用统一的Google工具调用处理器
+        if GoogleToolCallHandler.is_google_model(llm):
+            logger.info(f"📊 [市场分析师] 检测到Google模型，使用统一工具调用处理器")
+            
+            # 创建分析提示词
+            analysis_prompt_template = GoogleToolCallHandler.create_analysis_prompt(
+                ticker=ticker,
+                company_name=company_name,
+                analyst_type="市场分析",
+                specific_requirements="重点关注市场数据、价格走势、交易量变化等市场指标。"
+            )
+            
+            # 处理Google模型工具调用
+            report, messages = GoogleToolCallHandler.handle_google_tool_calls(
+                result=result,
+                llm=llm,
+                tools=tools,
+                state=state,
+                analysis_prompt_template=analysis_prompt_template,
+                analyst_name="市场分析师"
+            )
+
+            # 🔧 更新工具调用计数器
+            return {
+                "messages": [result],
+                "market_report": report,
+                "market_tool_call_count": tool_call_count + 1
+            }
+        else:
+            # 非Google模型的处理逻辑
+            logger.info(f"📊 [市场分析师] 非Google模型 ({llm.__class__.__name__})，使用标准处理逻辑")
+            logger.info(f"📊 [市场分析师] 检查LLM返回结果...")
+            logger.info(f"📊 [市场分析师] - 是否有tool_calls: {hasattr(result, 'tool_calls')}")
+            if hasattr(result, 'tool_calls'):
+                logger.info(f"📊 [市场分析师] - tool_calls数量: {len(result.tool_calls)}")
+                if result.tool_calls:
+                    for i, tc in enumerate(result.tool_calls):
+                        logger.info(f"📊 [市场分析师] - tool_call[{i}]: {tc.get('name', 'unknown')}")
+
+            # 处理市场分析报告
+            # 🔧 检测 LLM 是否将工具调用输出为文本（部分模型不支持原生 function calling）
+            content_str = (result.content or "") if hasattr(result, 'content') else ""
+            tool_calls_list = getattr(result, 'tool_calls', None) or []
+            has_text_tool_call = (
+                "<tool_call>" in content_str or
+                "get_stock_market_data_unified" in content_str or
+                "<function=" in content_str or
+                "<parameter=" in content_str
+            )
+            if len(tool_calls_list) == 0 or has_text_tool_call:
+                # 无工具调用 或 LLM 将工具调用输出为文本：启动强制补救，主动获取数据
+                logger.warning(f"📊 [市场分析师] ⚠️ LLM 未正确调用工具 (tool_calls={len(tool_calls_list)}, 文本含工具调用={has_text_tool_call})，启动强制补救...")
+                try:
+                    market_tool = tools[0]
+                    tool_args = {"ticker": ticker, "start_date": current_date, "end_date": current_date}
+                    logger.info(f"📊 [市场分析师] 🔧 强制调用 get_stock_market_data_unified: {tool_args}")
+                    tool_result = market_tool.invoke(tool_args)
+                    if tool_result and len(str(tool_result).strip()) > 100:
+                        # 使用干净提示，不传入含工具调用文本的 result，避免 LLM 混淆
+                        analysis_prompt = f"""您是一位专业的股票市场分析师。请基于以下已获取的市场数据，对股票 {ticker}（{company_name}）进行详细的技术分析。
+
+=== 市场数据 ===
+{str(tool_result)}
+
+=== 分析要求 ===
+请撰写详细的中文技术分析报告，包含：
+1. 股票基本信息（当前价格、涨跌幅、成交量）
+2. 技术指标分析（MA、MACD、RSI、布林带）
+3. 价格趋势分析
+4. 投资建议（评级、目标价、止损位）
+
+必须基于上述真实数据进行分析，报告不少于800字。不要输出任何工具调用或占位符。"""
+                        final_result = llm.invoke([
+                            {"role": "system", "content": f"你是专业的股票市场分析师。分析对象：{company_name}({ticker})，市场：{market_info['market_name']}。"},
+                            {"role": "user", "content": analysis_prompt}
+                        ])
+                        report = final_result.content if hasattr(final_result, 'content') else str(tool_result)[:500]
+                        logger.info(f"📊 [市场分析师] ✅ 强制补救成功，报告长度: {len(report)}")
+                        return {
+                            "messages": [AIMessage(content=report)],
+                            "market_report": report,
+                            "market_tool_call_count": tool_call_count + 1
+                        }
+                    else:
+                        logger.warning(f"📊 [市场分析师] ⚠️ 强制获取数据过短，使用原始回复")
+                        report = content_str
+                except Exception as e:
+                    logger.error(f"📊 [市场分析师] ❌ 强制补救失败: {e}")
+                    traceback.print_exc()
+                    report = content_str
+                logger.info(f"📊 [市场分析师] 直接回复（无工具调用/补救后），长度: {len(report)}")
+            else:
+                # 有工具调用，执行工具并生成完整分析报告
+                logger.info(f"📊 [市场分析师] 🔧 检测到工具调用: {[call.get('name', 'unknown') for call in result.tool_calls]}")
+
+                try:
+                    # 执行工具调用
+                    tool_messages = []
+                    for tool_call in result.tool_calls:
+                        tool_name = tool_call.get('name')
+                        tool_args = tool_call.get('args', {})
+                        tool_id = tool_call.get('id')
+
+                        logger.debug(f"📊 [DEBUG] 执行工具: {tool_name}, 参数: {tool_args}")
+
+                        # 找到对应的工具并执行
+                        tool_result = None
+                        for tool in tools:
+                            # 安全地获取工具名称进行比较
+                            current_tool_name = None
+                            if hasattr(tool, 'name'):
+                                current_tool_name = tool.name
+                            elif hasattr(tool, '__name__'):
+                                current_tool_name = tool.__name__
+
+                            if current_tool_name == tool_name:
+                                try:
+                                    if tool_name == "get_china_stock_data":
+                                        # 中国股票数据工具
+                                        tool_result = tool.invoke(tool_args)
+                                    else:
+                                        # 其他工具
+                                        tool_result = tool.invoke(tool_args)
+                                    logger.debug(f"📊 [DEBUG] 工具执行成功，结果长度: {len(str(tool_result))}")
+                                    break
+                                except Exception as tool_error:
+                                    logger.error(f"❌ [DEBUG] 工具执行失败: {tool_error}")
+                                    tool_result = f"工具执行失败: {str(tool_error)}"
+
+                        if tool_result is None:
+                            tool_result = f"未找到工具: {tool_name}"
+
+                        # 创建工具消息
+                        tool_message = ToolMessage(
+                            content=str(tool_result),
+                            tool_call_id=tool_id
+                        )
+                        tool_messages.append(tool_message)
+
+                    # 基于工具结果生成完整分析报告
+                    # 🔥 重要：这里必须包含公司名称和输出格式要求，确保LLM生成正确的报告标题
+                    analysis_prompt = f"""现在请基于上述工具获取的数据，生成详细的技术分析报告。
+
+**分析对象：**
+- 公司名称：{company_name}
+- 股票代码：{ticker}
+- 所属市场：{market_info['market_name']}
+- 计价货币：{market_info['currency_name']}（{market_info['currency_symbol']}）
+
+**输出格式要求（必须严格遵守）：**
+
+请按照以下专业格式输出报告，不要使用emoji符号（如📊📈📉💭等），使用纯文本标题：
+
+# **{company_name}（{ticker}）技术分析报告**
+**分析日期：[当前日期]**
+
+---
+
+## 一、股票基本信息
+
+- **公司名称**：{company_name}
+- **股票代码**：{ticker}
+- **所属市场**：{market_info['market_name']}
+- **当前价格**：[从工具数据中获取] {market_info['currency_symbol']}
+- **涨跌幅**：[从工具数据中获取]
+- **成交量**：[从工具数据中获取]
+
+---
+
+## 二、技术指标分析
+
+### 1. 移动平均线（MA）分析
+
+[分析MA5、MA10、MA20、MA60等均线系统，包括：]
+- 当前各均线数值
+- 均线排列形态（多头/空头）
+- 价格与均线的位置关系
+- 均线交叉信号
+
+### 2. MACD指标分析
+
+[分析MACD指标，包括：]
+- DIF、DEA、MACD柱状图当前数值
+- 金叉/死叉信号
+- 背离现象
+- 趋势强度判断
+
+### 3. RSI相对强弱指标
+
+[分析RSI指标，包括：]
+- RSI当前数值
+- 超买/超卖区域判断
+- 背离信号
+- 趋势确认
+
+### 4. 布林带（BOLL）分析
+
+[分析布林带指标，包括：]
+- 上轨、中轨、下轨数值
+- 价格在布林带中的位置
+- 带宽变化趋势
+- 突破信号
+
+---
+
+## 三、价格趋势分析
+
+### 1. 短期趋势（5-10个交易日）
+
+[分析短期价格走势，包括支撑位、压力位、关键价格区间]
+
+### 2. 中期趋势（20-60个交易日）
+
+[分析中期价格走势，结合均线系统判断趋势方向]
+
+### 3. 成交量分析
+
+[分析成交量变化，量价配合情况]
+
+---
+
+## 四、投资建议
+
+### 1. 综合评估
+
+[基于上述技术指标，给出综合评估]
+
+### 2. 操作建议
+
+- **投资评级**：买入/持有/卖出
+- **目标价位**：[给出具体价格区间] {market_info['currency_symbol']}
+- **止损位**：[给出止损价格] {market_info['currency_symbol']}
+- **风险提示**：[列出主要风险因素]
+
+### 3. 关键价格区间
+
+- **支撑位**：[具体价格]
+- **压力位**：[具体价格]
+- **突破买入价**：[具体价格]
+- **跌破卖出价**：[具体价格]
+
+---
+
+**重要提醒：**
+- 必须严格按照上述格式输出，使用标准的Markdown标题（#、##、###）
+- 不要使用emoji符号（📊📈📉💭等）
+- 所有价格数据使用{market_info['currency_name']}（{market_info['currency_symbol']}）表示
+- 确保在分析中正确使用公司名称"{company_name}"和股票代码"{ticker}"
+- 报告标题必须是：# **{company_name}（{ticker}）技术分析报告**
+- 报告必须基于工具返回的真实数据进行分析
+- 包含具体的技术指标数值和专业分析
+- 提供明确的投资建议和风险提示
+- 报告长度不少于800字
+- 使用中文撰写
+- 使用表格展示数据时，确保格式规范"""
+
+                    # 构建完整的消息序列
+                    messages = state["messages"] + [result] + tool_messages + [HumanMessage(content=analysis_prompt)]
+
+                    # 生成最终分析报告
+                    final_result = llm.invoke(messages)
+                    report = final_result.content
+
+                    logger.info(f"📊 [市场分析师] 生成完整分析报告，长度: {len(report)}")
+
+                    # 返回包含工具调用和最终分析的完整消息序列
+                    # 🔧 更新工具调用计数器
+                    return {
+                        "messages": [result] + tool_messages + [final_result],
+                        "market_report": report,
+                        "market_tool_call_count": tool_call_count + 1
+                    }
+
+                except Exception as e:
+                    logger.error(f"❌ [市场分析师] 工具执行或分析生成失败: {e}")
+                    traceback.print_exc()
+
+                    # 降级处理：返回工具调用信息
+                    report = f"市场分析师调用了工具但分析生成失败: {[call.get('name', 'unknown') for call in result.tool_calls]}"
+
+                    # 🔧 更新工具调用计数器
+                    return {
+                        "messages": [result],
+                        "market_report": report,
+                        "market_tool_call_count": tool_call_count + 1
+                    }
+
+            # 🔧 更新工具调用计数器
+            return {
+                "messages": [result],
+                "market_report": report,
+                "market_tool_call_count": tool_call_count + 1
+            }
+
+    return market_analyst_node

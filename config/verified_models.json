@@ -1,0 +1,65 @@
+{
+  "verified_google_models": {
+    "test_date": "2025-08-01",
+    "test_status": "all_passed",
+    "models": {
+      "gemini-2.5-pro": {
+        "status": "verified",
+        "avg_response_time": "16.68s",
+        "genai_test": "✅ (12.24s)",
+        "langchain_test": "✅ (21.13s)",
+        "recommended_for": "complex_analysis"
+      },
+      "gemini-2.5-flash": {
+        "status": "verified",
+        "avg_response_time": "2.73s",
+        "genai_test": "✅ (1.78s)",
+        "langchain_test": "✅ (3.68s)",
+        "recommended_for": "balanced_tasks"
+      },
+      "gemini-1.5-flash": {
+        "status": "verified",
+        "avg_response_time": "2.87s",
+        "genai_test": "✅ (1.82s)",
+        "langchain_test": "✅ (3.92s)",
+        "recommended_for": "general_tasks"
+      },
+      "gemini-1.5-pro": {
+        "status": "verified",
+        "avg_response_time": "2.25s",
+        "genai_test": "✅ (1.94s)",
+        "langchain_test": "✅ (2.57s)",
+        "recommended_for": "fast_analysis"
+      },
+      "gemini-2.0-flash": {
+        "status": "verified",
+        "avg_response_time": "1.87s",
+        "genai_test": "✅ (1.96s)",
+        "langchain_test": "✅ (1.78s)",
+        "recommended_for": "quick_tasks"
+      },
+      "gemini-2.5-flash-lite-preview-06-17": {
+        "status": "verified",
+        "avg_response_time": "1.45s",
+        "genai_test": "✅ (1.37s)",
+        "langchain_test": "✅ (1.53s)",
+        "recommended_for": "ultra_fast_tasks"
+      }
+    },
+    "recommended_defaults": {
+      "ultra_fast": "gemini-2.5-flash-lite-preview-06-17",
+      "fast": "gemini-2.0-flash",
+      "balanced": "gemini-1.5-pro",
+      "powerful": "gemini-2.5-pro"
+    },
+    "performance_ranking": [
+      "gemini-2.5-flash-lite-preview-06-17",
+      "gemini-2.0-flash",
+      "gemini-1.5-pro",
+      "gemini-2.5-flash",
+      "gemini-1.5-flash",
+      "gemini-2.5-pro"
+    ],
+    "note": "所有6个模型已通过双重测试验证，可安全使用"
+  }
+}

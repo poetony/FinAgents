@@ -1,0 +1,117 @@
+{
+  "tolerance_thresholds": {
+    "pe": 0.05,
+    "pb": 0.05,
+    "total_mv": 0.02,
+    "price": 0.01,
+    "volume": 0.10,
+    "turnover_rate": 0.05,
+    "roe": 0.03,
+    "roa": 0.03,
+    "eps": 0.02,
+    "bps": 0.02
+  },
+  "metric_weights": {
+    "pe": 0.25,
+    "pb": 0.25,
+    "total_mv": 0.20,
+    "price": 0.15,
+    "volume": 0.10,
+    "turnover_rate": 0.05
+  },
+  "consistency_thresholds": {
+    "high_consistency": 0.8,
+    "medium_consistency": 0.6,
+    "low_consistency": 0.3,
+    "max_significant_differences_ratio": 0.3
+  },
+  "actions": {
+    "use_either": {
+      "description": "数据高度一致，可以使用任一数据源",
+      "min_confidence": 0.8
+    },
+    "use_primary_with_warning": {
+      "description": "使用主数据源但发出警告",
+      "min_confidence": 0.6
+    },
+    "use_primary_only": {
+      "description": "仅使用主数据源",
+      "min_confidence": 0.3
+    },
+    "investigate_sources": {
+      "description": "需要调查数据源问题",
+      "min_confidence": 0.0
+    }
+  },
+  "data_source_priorities": {
+    "tushare": 1,
+    "akshare": 2,
+    "baostock": 3,
+    "tdx": 4
+  },
+  "data_source_reliability": {
+    "tushare": {
+      "reliability_score": 0.95,
+      "data_quality": "high",
+      "update_frequency": "daily",
+      "coverage": "comprehensive"
+    },
+    "akshare": {
+      "reliability_score": 0.80,
+      "data_quality": "medium",
+      "update_frequency": "real-time",
+      "coverage": "good"
+    },
+    "baostock": {
+      "reliability_score": 0.70,
+      "data_quality": "medium",
+      "update_frequency": "daily",
+      "coverage": "basic"
+    },
+    "tdx": {
+      "reliability_score": 0.60,
+      "data_quality": "low",
+      "update_frequency": "delayed",
+      "coverage": "limited"
+    }
+  },
+  "validation_rules": {
+    "pe_range": {
+      "min": 0,
+      "max": 1000,
+      "description": "PE ratio should be between 0 and 1000"
+    },
+    "pb_range": {
+      "min": 0,
+      "max": 50,
+      "description": "PB ratio should be between 0 and 50"
+    },
+    "total_mv_range": {
+      "min": 0,
+      "max": 100000000,
+      "description": "Total market value should be positive and reasonable"
+    },
+    "price_range": {
+      "min": 0.01,
+      "max": 10000,
+      "description": "Stock price should be between 0.01 and 10000"
+    },
+    "volume_range": {
+      "min": 0,
+      "max": 1000000000000,
+      "description": "Trading volume should be non-negative"
+    }
+  },
+  "logging": {
+    "log_consistency_checks": true,
+    "log_level": "INFO",
+    "log_detailed_differences": true,
+    "log_resolution_strategies": true
+  },
+  "performance": {
+    "max_stocks_to_compare": 100,
+    "timeout_seconds": 30,
+    "enable_caching": true,
+    "cache_ttl_minutes": 60
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "features/data_service": {
+    "debug_mode": false,
+    "cache_ttl": 1800,
+    "info_ttl": 3600,
+    "news_ttl": 1800
+  }
+}

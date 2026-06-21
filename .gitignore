@@ -1,0 +1,61 @@
+# ===== Secrets & Sensitive Config =====
+.env
+config/models.json
+config/settings.json
+config/usage.json
+
+# ===== Logs =====
+*.log
+logs/
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# ===== Virtual Environment =====
+venv/
+.venv/
+env/
+.env.venv/
+
+# ===== Data & Results (generated at runtime) =====
+data/
+results/
+eval_results/
+reports/
+uploads/
+
+# ===== Cache =====
+cache/
+*.cache
+tradingagents/dataflows/data_cache/
+tradingagents/dataflows/cache/
+
+# ===== Node / Frontend =====
+node_modules/
+dist/
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+.directory
+
+# ===== Docker / Deploy =====
+docker-compose.override.yml
+
+# ===== Misc =====
+*.tmp
+tmp_*
